@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+config.json
+state.json
+*.log
+browser-profile/
+config.setup.json
+*.tmp
+.instance.lock

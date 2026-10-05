@@ -1,0 +1,9 @@
+{
+  "channel_url": "https://discord.com/channels/123456789012345678/123456789012345679",
+  "message": "Check-in ✅",
+  "opening_time": "20:00",
+  "timezone": "Indian/Antananarivo",
+  "minutes_before": 5,
+  "minutes_after": 15,
+  "check_interval_seconds": 2
+}
