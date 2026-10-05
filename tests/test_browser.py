@@ -118,6 +118,18 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await wait_for_confirmation(self.page, self.config, {"chat-messages-old"}, 2))
         self.assertLess(await self.page.evaluate("performance.now() - confirmedAt"), 400)
 
+    async def test_css_visibility_change_without_mutation_wakes_observer(self):
+        await self.page.evaluate("""() => {
+            const style = document.createElement('style');
+            style.textContent = '@keyframes reveal { to { visibility: visible; } }';
+            document.head.append(style);
+            openChannel();
+            editor.style.visibility = 'hidden';
+            editor.style.animation = 'reveal 0.15s steps(1, end) forwards';
+        }""")
+        self.assertTrue(await wait_for_composer(self.page, self.config["channel_url"], 2))
+        self.assertEqual(await self.page.evaluate("enterCount"), 0)
+
     async def test_confirmation_ignores_existing_matching_message(self):
         await self.page.locator('#message-content-old').evaluate("(e, text) => e.textContent = text", self.config["message"])
         self.assertFalse(await wait_for_confirmation(self.page, self.config, {"chat-messages-old"}, 0.05))

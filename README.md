@@ -43,7 +43,7 @@ Example `config.json`:
 ```json
 {
   "channel_url": "https://discord.com/channels/123456789012345678/123456789012345679",
-  "message": "Check-in ?",
+  "message": "Check-in ✅",
   "opening_time": "20:00",
   "timezone": "Indian/Antananarivo",
   "minutes_before": 5,
@@ -63,9 +63,9 @@ by your server before starting.
 | `message` | Text to send; emoji and `\n` line breaks are supported. | Nonempty, at most 2,000 characters. |
 | `opening_time` | Expected opening time in the configured timezone. | `HH:MM`, default `20:00`. |
 | `timezone` | IANA timezone used for scheduling and the daily send key. | Default `Indian/Antananarivo`. |
-| `minutes_before` | Start watching this many minutes before opening. | 0?180, default 5. |
-| `minutes_after` | Keep waiting this many minutes after opening. | 1?180, default 15. |
-| `check_interval_seconds` | Main-loop recovery interval, not a delay imposed after an opening. | 1?60, default 2. |
+| `minutes_before` | Start watching this many minutes before opening. | 0–180, default 5. |
+| `minutes_after` | Keep waiting this many minutes after opening. | 1–180, default 15. |
+| `check_interval_seconds` | Main-loop recovery interval, not a delay imposed after an opening. | 1–60, default 2. |
 
 The defaults watch from **19:55 until 20:15 in Madagascar**. The opening time of
 20:00 corresponds to 19:00 in Switzerland during summer time and 18:00 during
