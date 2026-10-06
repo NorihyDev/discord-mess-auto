@@ -82,14 +82,17 @@ day is skipped. There is no send outside the window in scheduled mode.
 1. The scheduler calculates the active or next daily window. Outside that window,
    the Python process stays alive without keeping a browser open.
 2. At the start of the window, the browser opens the exact configured channel and
-   warms up Playwright's input helpers.
+   loads Playwright's selector helpers.
 3. A browser-side `MutationObserver` watches for an editable, visible message
-   composer. DOM changes wake the watcher immediately; a 100 ms browser-side
+   composer. DOM changes wake the watcher immediately; a 16 ms browser-side
    fallback also catches visibility changes caused by CSS. The configured main
    interval is used for recovery and checking the monitoring deadline.
-4. The observer returns the composer snapshot and existing message IDs together,
-   avoiding an extra browser round trip immediately after opening. A single-line
-   message is filled in one operation; multiline messages use Shift+Enter.
+4. The observer returns the composer snapshot and existing message IDs together.
+   For a single-line message, it also focuses and selects the empty editor in the
+   same browser turn. Native text insertion then avoids another selector/focus
+   round trip. A `beforeinput` guard cancels insertion if the focus, channel or
+   empty draft changed in the meantime. Multiline messages keep their native
+   Shift+Enter preparation.
 5. The app checks the channel, focus and prepared draft, writes a daily reservation
    to disk, and presses Enter. Existing drafts are preserved and stop the attempt.
 6. A second observer looks for a new matching message for up to ten seconds. This
@@ -100,6 +103,11 @@ Chromium background timer/rendering throttling is disabled for this dedicated
 browser. A normally loaded, closed channel is not periodically reloaded; recovery
 reloads are limited to pages with no main application container. This avoids
 interrupting the live interface around the expected opening.
+
+The 16 ms fallback is a timer target, not a guaranteed response time. Browser
+work, local command transport, CPU load and the pre-send state write still take
+time. Lowering `check_interval_seconds` does not speed up the normal observer
+path. No client-only optimization can make the delay depend solely on the network.
 
 `check-in.log` reports preparation through Enter and the time until a matching
 message is observed, in milliseconds. These measurements exclude browser startup

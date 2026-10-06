@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("check-in")
 COMPOSER = 'main [role="textbox"][contenteditable="true"][data-slate-editor="true"]'
 MESSAGE_ROWS = 'li[id^="chat-messages-"]'
-SNAPSHOT_SCRIPT = """({selector, url, rows}) => {
+SNAPSHOT_SCRIPT = """function snapshot({selector, url, rows, prepare = false}) {
     if (location.href.replace(/\\/$/, '') !== url) return {status: 'wrong_channel'};
     const editors = document.querySelectorAll(selector);
     if (editors.length !== 1) return {status: 'waiting', recoverable: !document.querySelector('main')};
@@ -28,9 +28,34 @@ SNAPSHOT_SCRIPT = """({selector, url, rows}) => {
         editor.matches(':disabled') || style.visibility === 'hidden' ||
         style.visibility === 'collapse' || editor.getClientRects().length === 0)
         return {status: 'waiting', recoverable: false};
-    return {status: 'ready', text: editor.innerText,
+    const result = {status: 'ready', text: editor.innerText,
         focused: document.activeElement === editor,
         ids: rows ? Array.from(document.querySelectorAll(rows), row => row.id) : []};
+    if (!prepare || result.text.replace(/[\\uFEFF\\u200B]/g, '').trim()) return result;
+    // Prepare native input in the same browser turn as opening detection.
+    // Never select a real draft; focus handlers may also change the page.
+    editor.focus({preventScroll: true});
+    const focused = snapshot({selector, url, rows: null});
+    if (focused.status !== 'ready') return focused;
+    if (focused.text.replace(/[\\uFEFF\\u200B]/g, '').trim()) return focused;
+    if (!focused.focused || document.querySelector(selector) !== editor)
+        return {...focused, preparation_failed: true};
+    const selection = getSelection();
+    if (!selection) return {...focused, preparation_failed: true};
+    selection.selectAllChildren(editor);
+    // Native keyboard input targets the focused element. Cancel insertion if
+    // focus, channel or the empty draft changed during the Python round trip.
+    const guard = event => {
+        const current = snapshot({selector, url, rows: null});
+        if (event.target !== editor || current.status !== 'ready' || !current.focused ||
+            current.text.replace(/[\\uFEFF\\u200B]/g, '').trim() ||
+            !editor.contains(selection.anchorNode) || !editor.contains(selection.focusNode))
+            event.preventDefault();
+    };
+    document.addEventListener('beforeinput', guard, {capture: true, once: true});
+    result.focused = true;
+    result.input_prepared = true;
+    return result;
 }"""
 
 
@@ -70,18 +95,20 @@ async def open_browser(playwright, headless: bool = False):
     )
 
 
-async def composer_snapshot(page, channel_url: str, include_messages=False) -> dict:
+async def composer_snapshot(page, channel_url: str, include_messages=False, *, prepare_input=False) -> dict:
     """Vérifie le salon, l'éditeur et le brouillon en un seul aller-retour."""
     return await page.evaluate(
         SNAPSHOT_SCRIPT,
-        {"selector": COMPOSER, "url": channel_url, "rows": MESSAGE_ROWS if include_messages else None},
+        {"selector": COMPOSER, "url": channel_url, "rows": MESSAGE_ROWS if include_messages else None,
+         "prepare": prepare_input},
     )
 
 
-async def wait_for_composer(page, channel_url: str, timeout_seconds: float, *, with_snapshot=False):
+async def wait_for_composer(page, channel_url: str, timeout_seconds: float, *, with_snapshot=False,
+                            prepare_input=False):
     """Réveille la surveillance dès qu'une mutation rend l'éditeur utilisable."""
     result = await page.evaluate(
-        """({selector, url, timeout, rows}) => new Promise(resolve => {
+        """({selector, url, timeout, rows, prepare}) => new Promise(resolve => {
             let finished = false;
             let observer;
             let timer;
@@ -95,7 +122,7 @@ async def wait_for_composer(page, channel_url: str, timeout_seconds: float, *, w
                 resolve(value);
             };
             const check = () => {
-                const snapshot = (__SNAPSHOT__)({selector, url, rows});
+                const snapshot = (__SNAPSHOT__)({selector, url, rows, prepare});
                 if (snapshot.status === 'ready') finish(snapshot);
             };
             observer = new MutationObserver(check);
@@ -103,11 +130,11 @@ async def wait_for_composer(page, channel_url: str, timeout_seconds: float, *, w
                 attributes: true, characterData: true});
             timer = setTimeout(() => finish(false), timeout);
             // CSS transitions may make an editor visible without a DOM mutation.
-            fallback = setInterval(check, 100);
+            fallback = setInterval(check, 16);
             check();
         })""".replace("__SNAPSHOT__", SNAPSHOT_SCRIPT),
         {"selector": COMPOSER, "url": channel_url, "timeout": max(1, timeout_seconds * 1000),
-         "rows": MESSAGE_ROWS if with_snapshot else None},
+         "rows": MESSAGE_ROWS if with_snapshot else None, "prepare": prepare_input},
     )
     return result if with_snapshot else bool(result)
 
@@ -119,7 +146,11 @@ def normalized(text: str) -> str:
 async def send_checkin(page, config: dict, state: DailyState, day: str, preview=False, *, snapshot=None) -> str:
     preparation_started = perf_counter()
     if snapshot is None:
-        snapshot = await composer_snapshot(page, config["channel_url"], include_messages=not preview)
+        snapshot = await composer_snapshot(
+            page, config["channel_url"], include_messages=not preview,
+            prepare_input=not preview and not state.blocked(config["channel_url"], day)
+            and "\n" not in config["message"],
+        )
     if snapshot["status"] != "ready":
         return "waiting"
     if preview:
@@ -130,13 +161,19 @@ async def send_checkin(page, config: dict, state: DailyState, day: str, preview=
     if normalized(snapshot["text"]):
         LOG.error("Un brouillon est déjà présent. Envoi arrêté pour ne pas l'écraser.")
         return "draft"
+    if snapshot.get("preparation_failed"):
+        LOG.error("Impossible de préparer le focus. Aucun envoi.")
+        return "prepare_failed"
     previous_ids = set(snapshot["ids"])
     editor = page.locator(COMPOSER)
     try:
         lines = config["message"].split("\n")
-        # Focus, sélection et insertion en une opération, sans attendre la
-        # stabilité d'un clic. Remplace aussi les marqueurs invisibles de Slate.
-        await editor.fill(lines[0], timeout=3000)
+        if snapshot.get("input_prepared"):
+            # Native input, without another locator/focus/select round trip.
+            # The observer selected only the empty editor (including Slate markers).
+            await page.keyboard.insert_text(lines[0])
+        else:
+            await editor.fill(lines[0], timeout=3000)
         for line in lines[1:]:
             # Conserve les sauts de ligne natifs de l'éditeur Discord.
             await editor.press("Shift+Enter", timeout=3000)
@@ -230,7 +267,7 @@ async def watch_window(playwright, config, state, day, end, preview=False) -> st
             LOG.warning("Premier chargement impossible. La surveillance continue dans la fenêtre prévue.")
         last_status = None
         last_reload = now()
-        # Warm Playwright's input helpers before the channel opens.
+        # Load Playwright's selector helpers before the channel opens.
         await page.locator(COMPOSER).count()
         ready_snapshot = None
         while now() < end:
@@ -265,6 +302,7 @@ async def watch_window(playwright, config, state, day, end, preview=False) -> st
                         ready_snapshot = await wait_for_composer(
                             page, config["channel_url"], min(config["check_interval_seconds"], remaining),
                             with_snapshot=True,
+                            prepare_input=not preview and "\n" not in config["message"],
                         ) or None
                     continue
             except BrowserError as exc:

@@ -5,7 +5,7 @@ import unittest
 
 from playwright.async_api import async_playwright
 
-from main import send_checkin, wait_for_composer, wait_for_confirmation
+from main import composer_snapshot, send_checkin, wait_for_composer, wait_for_confirmation
 from schedule import DailyState, load_config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +18,7 @@ HTML = '''<!doctype html><meta charset="utf-8">
 </main><script>
 window.enterCount = 0;
 const editor = document.querySelector('div[role=textbox]');
+editor.addEventListener('input', e => {window.inputTrusted = e.isTrusted;});
 editor.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault(); window.enterCount++; window.sentAt = performance.now();
@@ -69,6 +70,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.evaluate("enterCount"), 0)
         self.assertFalse(self.state.path.exists())
         self.assertEqual(await self.page.locator('div[role=textbox]').inner_text(), "")
+        self.assertFalse(await self.page.locator('div[role=textbox]').evaluate("e => document.activeElement === e"))
 
     async def test_draft_preserved(self):
         await self.page.evaluate("openChannel()")
@@ -100,13 +102,85 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_opening_snapshot_fast_path(self):
         await self.page.locator('div[role=textbox]').count()
         await self.page.evaluate("setTimeout(() => {openChannel(); window.openedAt = performance.now();}, 100)")
-        snapshot = await wait_for_composer(self.page, self.config["channel_url"], 2, with_snapshot=True)
+        snapshot = await wait_for_composer(
+            self.page, self.config["channel_url"], 2, with_snapshot=True, prepare_input=True,
+        )
         self.assertEqual(snapshot["status"], "ready")
+        self.assertTrue(snapshot["input_prepared"])
         self.assertIn("chat-messages-old", snapshot["ids"])
         self.assertEqual(await send_checkin(self.page, self.config, self.state, "2026-10-05", snapshot=snapshot), "confirmed")
+        self.assertTrue(await self.page.evaluate("inputTrusted"))
         delay = await self.page.evaluate("sentAt - openedAt")
         self.assertLess(delay, 1000)
         print(f"\nOptimized local fixture: opening -> Enter {delay:.1f} ms.")
+
+    async def test_draft_created_on_focus_is_preserved(self):
+        await self.page.evaluate("""() => {
+            openChannel();
+            editor.addEventListener('focus', () => {editor.textContent = 'Mon brouillon';}, {once: true});
+        }""")
+        self.assertEqual(await send_checkin(self.page, self.config, self.state, "2026-10-05"), "draft")
+        self.assertEqual(await self.page.locator('div[role=textbox]').inner_text(), "Mon brouillon")
+        self.assertEqual(await self.page.evaluate("enterCount"), 0)
+        self.assertFalse(self.state.path.exists())
+
+    async def test_focus_cannot_be_prepared_does_not_type(self):
+        await self.page.evaluate("""() => {
+            openChannel();
+            editor.addEventListener('focus', () => document.querySelector('input').focus());
+        }""")
+        self.assertEqual(await send_checkin(self.page, self.config, self.state, "2026-10-05"), "prepare_failed")
+        self.assertEqual(await self.page.locator('div[role=textbox]').inner_text(), "")
+        self.assertEqual(await self.page.locator('input').input_value(), "")
+        self.assertEqual(await self.page.evaluate("enterCount"), 0)
+        self.assertFalse(self.state.path.exists())
+
+    async def test_prepared_input_does_not_type_into_another_field(self):
+        await self.page.evaluate("openChannel()")
+        snapshot = await composer_snapshot(
+            self.page, self.config["channel_url"], include_messages=True, prepare_input=True,
+        )
+        await self.page.locator('input').focus()
+        result = await send_checkin(self.page, self.config, self.state, "2026-10-05", snapshot=snapshot)
+        self.assertEqual(result, "prepare_failed")
+        self.assertEqual(await self.page.locator('input').input_value(), "")
+        self.assertEqual(await self.page.locator('div[role=textbox]').inner_text(), "")
+        self.assertEqual(await self.page.evaluate("enterCount"), 0)
+        self.assertFalse(self.state.path.exists())
+
+    async def test_prepared_input_preserves_a_new_draft(self):
+        await self.page.evaluate("openChannel()")
+        snapshot = await composer_snapshot(
+            self.page, self.config["channel_url"], include_messages=True, prepare_input=True,
+        )
+        await self.page.locator('div[role=textbox]').evaluate("e => e.textContent = 'Nouveau brouillon'")
+        result = await send_checkin(self.page, self.config, self.state, "2026-10-05", snapshot=snapshot)
+        self.assertEqual(result, "prepare_failed")
+        self.assertEqual(await self.page.locator('div[role=textbox]').inner_text(), "Nouveau brouillon")
+        self.assertEqual(await self.page.evaluate("enterCount"), 0)
+        self.assertFalse(self.state.path.exists())
+
+    async def test_reserved_state_exists_before_enter(self):
+        original_record = self.state.record
+
+        def record_before_enter(url, day, status):
+            original_record(url, day, status)
+            if status == "reserved":
+                self.assertTrue(DailyState(self.state.path).blocked(url, day))
+
+        self.state.record = record_before_enter
+        await self.page.evaluate("openChannel()")
+        self.assertEqual(await send_checkin(self.page, self.config, self.state, "2026-10-05"), "confirmed")
+
+    async def test_reservation_failure_never_presses_enter(self):
+        def fail_record(*args):
+            raise OSError("Disk unavailable")
+
+        self.state.record = fail_record
+        await self.page.evaluate("openChannel()")
+        with self.assertRaises(OSError):
+            await send_checkin(self.page, self.config, self.state, "2026-10-05")
+        self.assertEqual(await self.page.evaluate("enterCount"), 0)
 
     async def test_confirmation_observes_delayed_message(self):
         await self.page.evaluate("""setTimeout(() => {
